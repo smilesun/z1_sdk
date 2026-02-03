@@ -8,6 +8,7 @@
 
 using namespace UNITREE_ARM;
 
+// Clamp each element of a 6D vector to [low, high] for torque limiting.
 Vec6 clampVec6(const Vec6& v, double low, double high)
 {
     Vec6 result;
@@ -18,8 +19,12 @@ Vec6 clampVec6(const Vec6& v, double low, double high)
 }
 
 int main(int argc, char *argv[]) {
+    // Open a non-blocking "barrier" file to gate the start of the motion.
     int fd = open("/tmp/run_barrier", O_RDONLY | O_NONBLOCK); //open a temporary file for busy waiting
+    //return -1 with errno = EAGAIN/EWOULDBLOCK if no data is available, so the loop can keep running without getting stuck.
 
+
+    // Load the nominal trajectory CSV from disk.
     using clock = std::chrono::steady_clock;
     std::ifstream file("../examples/nominal_trajectory.csv");
     if (!file.is_open()) {
@@ -27,6 +32,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Parse CSV rows into a vector of doubles.
     std::string line;
     std::getline(file, line); // skip header
 
@@ -41,7 +47,7 @@ int main(int argc, char *argv[]) {
         rows.push_back(row);
     }
 
-    // Convert to Eigen matrix
+    // Convert to Eigen matrices for convenient column access.
     size_t nrows = rows.size();
     size_t ncols = rows[0].size();
     Eigen::MatrixXd data(nrows, ncols);
@@ -49,7 +55,7 @@ int main(int argc, char *argv[]) {
         for (size_t j = 0; j < ncols; ++j)
             data(i, j) = rows[i][j];
 
-    // Extract back into arrays
+    // Extract time, joint positions, velocities, and feedforward torques.
     Eigen::VectorXd t_interp = data.col(0);
     Eigen::MatrixXd q_interp = data.block(0, 1, nrows, 6).transpose();
     Eigen::MatrixXd q_dot_interp = data.block(0, 7, nrows, 6).transpose();
@@ -58,19 +64,23 @@ int main(int argc, char *argv[]) {
     // std::cout << "Loaded " << nrows << " rows.\n";
     // std::cout << "First time: " << t(0) << "\n";
     // std::cout << "First q: " << q.col(0).transpose() << "\n";
+    // Determine the trajectory sample period and endpoint poses.
     double dt = t_interp(1) - t_interp(0);
     Vec6 q_init = q_interp.col(0);
     Vec6 q_end = q_interp.col(q_interp.cols() - 1);
 
+    // Initialize arm interface and start background send/receive thread.
     std::cout << std::fixed << std::setprecision(3);
     bool hasGripper = true;
     unitreeArm arm(hasGripper);
     arm.sendRecvThread->start();
 
+    // Move to home, then switch to low-level command mode.
     arm.backToStart();
     arm.setFsm(ArmFSMState::PASSIVE);
     arm.setFsm(ArmFSMState::LOWCMD);
 
+    // Read default gains and re-apply them explicitly.
     std::vector<double> KP, KW;
     KP = arm._ctrlComp->lowcmd->kp;
     KW = arm._ctrlComp->lowcmd->kd;
@@ -81,10 +91,12 @@ int main(int argc, char *argv[]) {
     Eigen::Map<const Vec6> KP_Eigen(KP.data());
     Eigen::Map<const Vec6> KW_Eigen(KW.data());
     // arm._ctrlComp->lowcmd->setGripperGain(KP[KP.size()-1], KW[KW.size()-1]);
+    // Stop the background thread; this example drives send/recv manually.
     arm.sendRecvThread->shutdown();
 
     Vec6 initQ = arm.lowstate->getQ();
 
+    // Ramp from current pose to the initial trajectory pose.
     double duration;
     duration = 3/arm._ctrlComp->dt; // use 3 seconds to reach the initial pose
     double tau_limit = 30.0;
@@ -108,6 +120,7 @@ int main(int argc, char *argv[]) {
         timer_init.sleep();
     }
 
+    // Hold at the initial pose until an external signal is received.
     while (true) //std::chrono::duration<double>(clock::now() - start_time).count() < warmup_time
     {
         arm.q << q_init;
@@ -131,6 +144,7 @@ int main(int argc, char *argv[]) {
         timer.sleep();
     }
 
+    // Optional fixed delay before executing the catch trajectory.
     double time_delay = 0.121;  // 0.12 seconds for robust nominal trajectory, 0.125 seconds for robust nominal trajectory
     auto start_time = clock::now();
     while (std::chrono::duration<double>(clock::now() - start_time).count() < time_delay) //
@@ -138,6 +152,9 @@ int main(int argc, char *argv[]) {
         arm.q << q_init;
         arm.qd << 0,0,0,0,0,0;
         outputTau = arm._ctrlComp->armModel->inverseDynamics(arm.q, arm.qd, Vec6::Zero(), Vec6::Zero());
+        // - qdd: joint accelerations, set to zero (no acceleration assumed) 
+        // - Ftip: end‑effector spatial force, set to zero (no external wrench)
+
         arm.tau = clampVec6(outputTau, -tau_limit, tau_limit);
         arm.gripperQ = 0;
         // std::cout << arm.tau.transpose()<<"\n";
@@ -149,6 +166,7 @@ int main(int argc, char *argv[]) {
         timer.sleep();
     }
 
+    // Execute the trajectory from the CSV.
     auto actual_delay = std::chrono::duration<double>(clock::now() - start_time);
     std::cout << "Actual time delay: " << actual_delay.count()<<"\n";
 
@@ -178,6 +196,7 @@ int main(int argc, char *argv[]) {
         timer.sleep();
     }
 
+    // Hold the final pose for a fixed duration.
     double holding_time = 10.0;  // seconds
     auto finish_time = clock::now();
     while (std::chrono::duration<double>(clock::now() - finish_time).count() < holding_time) 
@@ -196,6 +215,7 @@ int main(int argc, char *argv[]) {
         timer.sleep();
     }
 
+    // Restart the background thread for standard post-motion handling.
     arm.sendRecvThread->start();
 
     arm.setFsm(ArmFSMState::JOINTCTRL);
@@ -203,6 +223,7 @@ int main(int argc, char *argv[]) {
     arm.setFsm(ArmFSMState::PASSIVE);
     arm.sendRecvThread->shutdown();
 
+    // Close the barrier file and exit.
     close(fd);
     return 0;
 }
